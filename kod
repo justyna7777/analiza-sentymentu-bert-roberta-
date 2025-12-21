@@ -1,0 +1,239 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+from transformers import BertTokenizer
+from transformers import RobertaTokenizer
+from transformers import RobertaForSequenceClassification, RobertaTokenizer, get_linear_schedule_with_warmup
+#!pip install --upgrade protobuf transformers --quiet  
+#!pip install transformers torch --quiet
+from transformers import BertForSequenceClassification, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from sklearn.metrics import roc_curve, auc, confusion_matrix
+#from bs4 import BeautifulSoup
+#import re
+#Wczytano dane "amazon reviews" (z kolumnami "rating" oraz "text") z pliku CSV używając średnika jako separatora oraz wymuszając typ tekstowy (str) dla kolumny text
+plik = '/kaggle/input/amazon/amazon.csv' 
+df = pd.read_csv(plik,sep=';',dtype={'text': str},nrows=60000)  
+print(df.head())
+#Sprawdzenie czy są wartości NAN 
+#nan_counts= df.isna().sum()
+#print(nan_counts)
+
+#Usuwanie braków danych 
+df.dropna(inplace=True)
+#usuwanie tagów HTML
+#po usunięciu tagów HTML następiło minimalne pogorszenie wyników - mozliwa przyczyna: modele uczą się na tekstach z internetu, gdzie tagi HTML występują naturalnie, więc ich usunięcie zmienia dystrybucję danych, do której model był przyzwyczajony podczas pre-treningu
+#def clean_text(text):
+#    if text is None:
+#        return ""
+#    text = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)    # #Zamiana <br> i <br /> na spację
+#    text = BeautifulSoup(text, "html.parser").get_text(separator=" ")
+#    text = re.sub(r'\s+', ' ', text)   # Usunięcie nadmiarowych spacji i #nowych linii
+#    
+#    return text.strip()  #usuwa białe znaki z początku i końca tekstu.
+#Tworzenie etykiet binarnych :   
+
+def map_sentiment_binary(rating):
+    if rating in [1, 2,3]:
+        return 0   # Negatywny
+    else:
+        return 1   # Pozytywny 
+
+df["sentiment_label"] = df["rating"].apply(map_sentiment_binary)
+print(df["sentiment_label"].value_counts())
+
+#Porównanie rozkładów klas:
+#1. dla 1,2 - 0 (Negatywny),  3,4,5 - 1 (Pozytywny) wynik: sentiment_label 1  -  49830, 0  - 10159
+#2. dla 1,2,3 - 0 (Negatywny),  4,5 - 1 (Pozytywny) wynik: sentiment_label 1  -  44318, 0  -  15671
+#Wybrano wariant 2, ponieważ taki podział zapewnia lepsze zbalansowanie klas oraz bardziej wiarygodną analizę metryk jakości klasyfikacji
+# Podział na Train (70%) i Temp (30%)
+train_df, temp_df = train_test_split(df, test_size=0.30,  random_state=42, stratify=df["sentiment_label"])  # (stratify - zachowanie proporcji klas 0/1)
+
+# Podział 'Temp_df' na Val (15%) i Test (15%)                                     
+val_df, test_df = train_test_split(temp_df, test_size=0.50, random_state=42,stratify=temp_df["sentiment_label"])
+
+print(len(train_df), len(val_df), len(test_df))
+
+MAX_LEN = 160   #Max długość sekwencji wejściowej (liczba tokenów)- ustalona dlugość 160 (bo wykonane wcześniej obliczenia pokazały, że 90%-95% tekstow opinii mieści się w 160 tokenach, dzięki temu trening jest szybszy, zużywa mniej pamięci GPU i ogranicza ilość pustych tokenów)
+BATCH_SIZE = 16    #Liczba próbek przetwarzanych jednocześnie w jednym kroku treningowym
+EPOCHS = 3  #Liczba epok treningowych (epoka - pełne przejście przez zbiór treningowy)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Automatycznie wybiera GPU (trzeba właczyć tą opcje w session options w Kaggle), jeśli GPU nie jest dostępne to będzie działać na CPU 
+#print("Using device:", device)
+
+class AmazonReviewsDataset(Dataset):  
+    def __init__(self, df, tokenizer, max_len):   #Konstruktor klasy inicjalizuje zbiór danych zapisując teksty opinii, odpowiadające im etykiety sentymentu oraz parametry tokenizacji
+        self.texts = df["text"].tolist()   
+        self.labels = df["sentiment_label"].tolist()
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):  #Oblicza długość zbioru danych
+        return len(self.texts)
+
+    def __getitem__(self, idx):  #Pobiera pojedynczą próbkę
+        encoded = self.tokenizer(
+            self.texts[idx],
+            truncation=True,      #obcina teksty dłuższe niż MAX_LEN
+            padding="max_length",   #dopełnia krótsze teksty do długości MAX_LEN
+            max_length=self.max_len,
+            return_tensors="pt"   #zwraca tensory PyTorch
+        )
+
+        return {
+            "input_ids": encoded["input_ids"].squeeze(0),    #Sekwencja tokenów reprezentujących tekst
+            "attention_mask": encoded["attention_mask"].squeeze(0),  #Maska informująca model, które tokeny są rzeczywistą treścią (1), a które paddingiem (0)
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long)
+        }
+#tensor typu long, ponieważ funkcja straty CrossEntropyLoss w PyTorch (automatycznie wywoływana wewnątrz modelu podczas treningu) wymaga etykiet w postaci indeksów klas zapisanych jako liczby całkowite
+#queeze(0) usuwa nadmiarowy wymiar batcha zwracany przez tokenizer, dzięki czemu pojedyncza próbka ma poprawny kształt wejściowy dla modelu
+#Tokenizer:zamienia tekst na formę danych, którą model BERT i RoBERTa potrafią przyjąć
+
+def get_metrics(y_true, y_pred):   #funkcja, która przyjmuje prawdziwe etykiety i predykcje
+    report = classification_report(y_true, y_pred, target_names=["Negative", "Positive"], output_dict=True)
+    accuracy = np.mean(np.array(y_true) == np.array(y_pred))
+    metrics = {   #słownik, w którym zapisujemy precision, recall i F1-score dla każdej klasy osobno
+        "Negative": {
+            "precision": report["Negative"]["precision"],
+            "recall": report["Negative"]["recall"],
+            "f1": report["Negative"]["f1-score"]
+        },
+        "Positive": {
+            "precision": report["Positive"]["precision"],
+            "recall": report["Positive"]["recall"],
+            "f1": report["Positive"]["f1-score"]
+        }
+    }
+    return accuracy, metrics
+
+bert_acc, bert_metrics = get_metrics(results["BERT"]["y_true"], results["BERT"]["y_pred"])  #Wywołanie funkcji dla modeli BERT i RoBERTa
+roberta_acc, roberta_metrics = get_metrics(results["RoBERTa"]["y_true"], results["RoBERTa"]["y_pred"])
+
+bert_color = "#F7A8B8"    #kolory słupków
+roberta_color = "#C7B8EA" 
+
+def draw_bar_chart(labels, bert_vals, roberta_vals, title, ylabel):  #do rysowania wykresów słupkowych
+    plt.figure(figsize=(7,5))
+    x = np.arange(len(labels))
+    width = 0.35
+
+    plt.bar(x - width/2, bert_vals, width, label="BERT", edgecolor="black", color=bert_color)
+    plt.bar(x + width/2, roberta_vals, width, label="RoBERTa", edgecolor="black", color=roberta_color)
+
+    for i, v in enumerate(bert_vals):  #wartości liczbowe nad słupkami
+        plt.text(i - width/2, v + 0.005, f"{v:.4f}", ha="center", fontsize=11, fontweight="bold")
+
+    for i, v in enumerate(roberta_vals):
+        plt.text(i + width/2, v + 0.005, f"{v:.4f}", ha="center", fontsize=11, fontweight="bold")
+
+    plt.xticks(x, labels)
+    plt.ylabel(ylabel)
+    plt.title(title, fontweight="bold")
+    plt.ylim(0, 1.05)
+    plt.legend()
+    plt.grid(axis='y', linestyle='--', alpha=0.4)
+    plt.show()
+
+# wykres porównujący accuracy obu modeli
+draw_bar_chart(
+    labels=["Accuracy"],
+    bert_vals=[bert_acc],
+    roberta_vals=[roberta_acc],
+    title="Porównanie dokładności (Accuracy)",
+    ylabel="Accuracy"
+)
+
+#Obliczenie Macro F1 (średnia F1 obu klas)
+bert_macro_f1 = np.mean([bert_metrics["Negative"]["f1"], bert_metrics["Positive"]["f1"]])
+roberta_macro_f1 = np.mean([roberta_metrics["Negative"]["f1"], roberta_metrics["Positive"]["f1"]])
+
+draw_bar_chart(   #wykres porównujący Macro F1
+    labels=["Macro F1"],
+    bert_vals=[bert_macro_f1],
+    roberta_vals=[roberta_macro_f1],
+    title="Porównanie Macro F1",
+    ylabel="Macro F1"
+)
+
+# wykresy słupkowe dla każdej metryki (precision, recall, f1) i dla obu klas
+for metric in ["precision", "recall", "f1"]:
+    draw_bar_chart(
+        labels=["Negative", "Positive"],
+        bert_vals=[bert_metrics["Negative"][metric], bert_metrics["Positive"][metric]],
+        roberta_vals=[roberta_metrics["Negative"][metric], roberta_metrics["Positive"][metric]],
+        title=f"Porównanie {metric.capitalize()} dla każdej klasy",
+        ylabel=metric.capitalize()
+)
+#accuracy=(tp+tn)/(tp+tn+fp+fn)
+#macro f1 - średnia arytmetyczna F1 dla obu klas: macro f1=(f1 positive+f1 negative)/2
+#Precision dla klasy positive można policzyć z macierzy pomyłek z wzoru: precision=TP/(TP+FP)
+#Recall dla klasy positive: recall= TP/(TP+FN) 
+#f1 dla klasy positive: f1=2*(precision*recall)/(precision+recall)
+def calculate_extra_metrics(all_labels, all_probs, model_name):   #Funkcja obliczjąca dodatkowe metryki 
+    all_labels = np.array(all_labels)  # Konwersja na numpy (do obliczen)
+    all_probs = np.array(all_probs)
+    
+    fpr, tpr, _ = roc_curve(all_labels, all_probs)   #Obliczenie punktów krzywej ROC: False Positive Rate (fpr), True Positive Rate (tpr) i progów (thresholds)
+    roc_auc = auc(fpr, tpr)  #Obliczenie pola pod krzywą ROC
+    
+    all_preds = (all_probs >= 0.4).astype(int)  #all_probs to tablica z wartościami prawdopodobieństwa klasy pozytywnej (1), zamienia prawdopodobieństwa w predykcje klasowe przy progu decyzyjnym 0.5
+    
+    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds).ravel()   # wartości: TN, FP, FN, TP z macierz pomyłek
+    
+    specificity = tn / (tn + fp)  # Specyficzność= TN / (TN + FP) - miara poprawnego odrzucania negatywów
+    sensitivity = tp / (tp + fn)  # Czułość (Sensitivity/Recall)= TP / (TP + FN) - miara poprawnego wykrywania pozytywów
+    
+    print(f"\n Metryki dla {model_name}")
+    print(f"AUC-ROC: {roc_auc:.4f}")
+    print(f"Czułość (Sensitivity/Recall): {sensitivity:.4f}")
+    print(f"Specyficzność (Specificity): {specificity:.4f}")
+    
+    return fpr, tpr, roc_auc
+
+fpr_bert, tpr_bert, auc_bert = calculate_extra_metrics(all_labels_bert, results["BERT"]["probs"], "BERT")  #wywołanie funkcji dla modelu bert i roberta
+fpr_roberta, tpr_roberta, auc_roberta = calculate_extra_metrics(all_labels_roberta, results["RoBERTa"]["probs"], "RoBERTa")
+
+# rysowanie wykresu ROC
+plt.figure(figsize=(8, 6))
+plt.plot(fpr_bert, tpr_bert, color='blue', label=f'BERT (AUC = {auc_bert:.4f})')   #Krzywa ROC dla BERT
+plt.plot(fpr_roberta, tpr_roberta, color='red', label=f'RoBERTa (AUC = {auc_roberta:.4f})')   #Krzywa ROC dla ROBERTA
+plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate (1 - Specyficzność)')
+plt.ylabel('True Positive Rate (Czułość)')
+plt.title('Krzywa ROC - Porównanie modeli')
+plt.legend(loc="lower right")
+plt.grid(linestyle='--', alpha=0.4)
+plt.show()
+# Teksty do analizy długości 
+texts = train_df["text"].tolist()
+
+# Liczenie długości sekwencji tokenów
+bert_lengths = [len(tokenizer_bert.tokenize(text)) for text in texts]
+roberta_lengths = [len(tokenizer_roberta.tokenize(text)) for text in texts]
+
+# Percentyle (uzasadnienie wyboru MAX_LEN)
+for p in [90, 95]:
+    print(f"BERT – {p} percentyl: {np.percentile(bert_lengths, p):.0f} tokenów")
+    print(f"RoBERTa – {p} percentyl: {np.percentile(roberta_lengths, p):.0f} tokenów")
+    print("-" * 40)
+
+# Wykres rozkładu długości
+plt.figure(figsize=(10, 6))
+plt.hist(bert_lengths, bins=50, alpha=0.6, label="BERT", density=True)
+plt.hist(roberta_lengths, bins=50, alpha=0.6, label="RoBERTa", density=True)
+plt.axvline(160, color="black", linestyle="--", label="MAX_LEN = 160")
+plt.xlabel("Liczba tokenów")
+plt.ylabel("Gęstość")
+plt.title("Rozkład długości sekwencji tokenów – BERT vs RoBERTa")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+
